@@ -1,0 +1,255 @@
+"""
+Serviço de Treinamento Real YOLO com Ultralytics
+Este serviço recebe requisições do Supabase Edge Function e executa treinamento real de modelos YOLO.
+"""
+
+from flask import Flask, request, jsonify
+import base64
+import zipfile
+import io
+import os
+import shutil
+import requests
+import logging
+from pathlib import Path
+from ultralytics import YOLO
+import torch
+
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Diretórios de trabalho
+WORK_DIR = Path('./workdir')
+DATASETS_DIR = WORK_DIR / 'datasets'
+MODELS_DIR = WORK_DIR / 'models'
+RUNS_DIR = WORK_DIR / 'runs'
+
+# Criar diretórios se não existirem
+for dir_path in [WORK_DIR, DATASETS_DIR, MODELS_DIR, RUNS_DIR]:
+    dir_path.mkdir(parents=True, exist_ok=True)
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint de health check"""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return jsonify({
+        'status': 'healthy',
+        'device': device,
+        'ultralytics_version': YOLO.__version__ if hasattr(YOLO, '__version__') else 'unknown'
+    })
+
+@app.route('/train', methods=['POST'])
+def train():
+    """Endpoint principal de treinamento"""
+    data = request.json
+    
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    
+    job_id = data.get('job_id')
+    callback_url = data.get('callback_url')
+    callback_token = data.get('callback_token')
+    
+    if not all([job_id, callback_url, callback_token]):
+        return jsonify({'error': 'Missing required fields: job_id, callback_url, callback_token'}), 400
+    
+    logger.info(f"Starting training job {job_id}")
+    
+    # Criar diretório do job
+    job_dir = DATASETS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # 1. Decode e extrair dataset
+        logger.info(f"Decoding dataset for job {job_id}")
+        dataset_base64 = data.get('dataset_base64', '')
+        
+        if not dataset_base64:
+            raise ValueError("dataset_base64 is required")
+        
+        dataset_bytes = base64.b64decode(dataset_base64)
+        
+        logger.info(f"Extracting dataset ZIP ({len(dataset_bytes)} bytes)")
+        with zipfile.ZipFile(io.BytesIO(dataset_bytes)) as zip_ref:
+            zip_ref.extractall(job_dir)
+        
+        # Verificar se data.yaml existe
+        data_yaml_path = job_dir / 'data.yaml'
+        if not data_yaml_path.exists():
+            # Procurar em subdiretórios
+            yaml_files = list(job_dir.rglob('data.yaml'))
+            if yaml_files:
+                data_yaml_path = yaml_files[0]
+            else:
+                raise FileNotFoundError("data.yaml not found in dataset")
+        
+        logger.info(f"Found data.yaml at: {data_yaml_path}")
+        
+        # 2. Carregar modelo base
+        base_model = data.get('base_model', 'yolov8n')
+        logger.info(f"Loading base model: {base_model}")
+        
+        # Garantir que o modelo tem a extensão .pt
+        if not base_model.endswith('.pt'):
+            base_model = f"{base_model}.pt"
+        
+        model = YOLO(base_model)
+        
+        # 3. Configurar parâmetros de treinamento
+        config = data.get('config', {})
+        epochs = config.get('epochs', 100)
+        batch_size = config.get('batch_size', 16)
+        img_size = config.get('img_size', 640)
+        learning_rate = config.get('learning_rate', 0.01)
+        
+        # Detectar device (GPU ou CPU)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        logger.info(f"Training on device: {device}")
+        
+        # 4. Definir callback de progresso
+        def send_callback(callback_type, callback_data):
+            """Envia callback para o Supabase"""
+            try:
+                payload = {
+                    'job_id': job_id,
+                    'type': callback_type,
+                    'data': callback_data
+                }
+                
+                response = requests.post(
+                    callback_url,
+                    json=payload,
+                    headers={'Authorization': f'Bearer {callback_token}'},
+                    timeout=10
+                )
+                
+                if response.status_code != 200:
+                    logger.warning(f"Callback failed: {response.status_code} - {response.text}")
+                else:
+                    logger.info(f"Callback sent: {callback_type}")
+                    
+            except Exception as e:
+                logger.error(f"Error sending callback: {e}")
+        
+        # Callback customizado para cada época
+        class TrainingCallback:
+            def __init__(self, total_epochs):
+                self.total_epochs = total_epochs
+                self.current_epoch = 0
+            
+            def on_train_epoch_end(self, trainer):
+                """Chamado ao final de cada época"""
+                self.current_epoch = trainer.epoch + 1
+                progress = int((self.current_epoch / self.total_epochs) * 100)
+                
+                # Extrair métricas
+                metrics = trainer.metrics if hasattr(trainer, 'metrics') else {}
+                loss = trainer.loss.item() if hasattr(trainer, 'loss') and trainer.loss is not None else 0.0
+                
+                callback_data = {
+                    'current_epoch': self.current_epoch,
+                    'progress': progress,
+                    'loss': float(loss),
+                    'metrics': {
+                        'precision': float(metrics.get('metrics/precision(B)', 0)),
+                        'recall': float(metrics.get('metrics/recall(B)', 0)),
+                        'mAP50': float(metrics.get('metrics/mAP50(B)', 0)),
+                        'mAP50_95': float(metrics.get('metrics/mAP50-95(B)', 0)),
+                        'box_loss': float(metrics.get('train/box_loss', 0)),
+                        'cls_loss': float(metrics.get('train/cls_loss', 0)),
+                        'dfl_loss': float(metrics.get('train/dfl_loss', 0)),
+                    }
+                }
+                
+                send_callback('training_progress', callback_data)
+        
+        # 5. Iniciar treinamento
+        callback_handler = TrainingCallback(epochs)
+        
+        logger.info(f"Starting training: {epochs} epochs, batch={batch_size}, imgsz={img_size}")
+        
+        results = model.train(
+            data=str(data_yaml_path),
+            epochs=epochs,
+            batch=batch_size,
+            imgsz=img_size,
+            lr0=learning_rate,
+            device=device,
+            project=str(RUNS_DIR),
+            name=job_id,
+            exist_ok=True,
+            callbacks={
+                'on_train_epoch_end': callback_handler.on_train_epoch_end
+            }
+        )
+        
+        logger.info(f"Training completed for job {job_id}")
+        
+        # 6. Ler modelo treinado e converter para base64
+        model_path = RUNS_DIR / job_id / 'weights' / 'best.pt'
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Trained model not found at {model_path}")
+        
+        logger.info(f"Reading trained model from: {model_path}")
+        
+        with open(model_path, 'rb') as f:
+            model_bytes = f.read()
+            model_base64 = base64.b64encode(model_bytes).decode('utf-8')
+        
+        # Extrair métricas finais
+        final_metrics = {}
+        if hasattr(results, 'results_dict'):
+            rd = results.results_dict
+            final_metrics = {
+                'precision': float(rd.get('metrics/precision(B)', 0)),
+                'recall': float(rd.get('metrics/recall(B)', 0)),
+                'mAP50': float(rd.get('metrics/mAP50(B)', 0)),
+                'mAP50_95': float(rd.get('metrics/mAP50-95(B)', 0)),
+            }
+        
+        # 7. Enviar callback de conclusão
+        send_callback('training_completed', {
+            'model_base64': model_base64,
+            'model_name': data.get('model_name'),
+            'final_metrics': final_metrics
+        })
+        
+        # 8. Cleanup
+        logger.info(f"Cleaning up job {job_id}")
+        shutil.rmtree(job_dir, ignore_errors=True)
+        shutil.rmtree(RUNS_DIR / job_id, ignore_errors=True)
+        
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'message': 'Training completed successfully'
+        })
+        
+    except Exception as e:
+        logger.error(f"Training failed for job {job_id}: {e}", exc_info=True)
+        
+        # Enviar callback de erro
+        send_callback('training_failed', {
+            'error': str(e)
+        })
+        
+        # Cleanup em caso de erro
+        shutil.rmtree(job_dir, ignore_errors=True)
+        shutil.rmtree(RUNS_DIR / job_id, ignore_errors=True)
+        
+        return jsonify({
+            'error': str(e),
+            'job_id': job_id
+        }), 500
+
+if __name__ == '__main__':
+    # Porta padrão: 5000
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
