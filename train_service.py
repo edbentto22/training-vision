@@ -66,16 +66,23 @@ def train():
     job_dir.mkdir(parents=True, exist_ok=True)
     
     try:
-        # 1. Decode e extrair dataset
-        logger.info(f"Decoding dataset for job {job_id}")
-        dataset_base64 = data.get('dataset_base64', '')
+        # 1. Download dataset from URL
+        dataset_url = data.get('dataset_url')
         
-        if not dataset_base64:
-            raise ValueError("dataset_base64 is required")
+        if not dataset_url:
+            raise ValueError("dataset_url is required")
         
-        dataset_bytes = base64.b64decode(dataset_base64)
+        logger.info(f"Downloading dataset from: {dataset_url}")
         
-        logger.info(f"Extracting dataset ZIP ({len(dataset_bytes)} bytes)")
+        # Download com timeout e streaming
+        response = requests.get(dataset_url, stream=True, timeout=300)
+        response.raise_for_status()
+        
+        dataset_bytes = response.content
+        logger.info(f"Dataset downloaded: {len(dataset_bytes)} bytes")
+        
+        # Extrair dataset ZIP
+        logger.info("Extracting dataset ZIP")
         with zipfile.ZipFile(io.BytesIO(dataset_bytes)) as zip_ref:
             zip_ref.extractall(job_dir)
         
