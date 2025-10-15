@@ -47,19 +47,32 @@ def health_check():
 @app.route('/train', methods=['POST'])
 def train():
     """Endpoint principal de treinamento"""
-    data = request.json
-    
-    if not data:
-        return jsonify({'error': 'No data provided'}), 400
-    
-    job_id = data.get('job_id')
-    callback_url = data.get('callback_url')
-    callback_token = data.get('callback_token')
-    
-    if not all([job_id, callback_url, callback_token]):
-        return jsonify({'error': 'Missing required fields: job_id, callback_url, callback_token'}), 400
-    
-    logger.info(f"Starting training job {job_id}")
+    try:
+        data = request.json
+        
+        if not data:
+            logger.error("No JSON data received in request")
+            return jsonify({'error': 'No data provided'}), 400
+        
+        # Log da requisição (sem incluir a URL do dataset completa)
+        log_data = {k: v for k, v in data.items() if k != 'dataset_url'}
+        if 'dataset_url' in data:
+            log_data['dataset_url'] = '***PROVIDED***'
+        logger.info(f"Received training request: {log_data}")
+        
+        job_id = data.get('job_id')
+        callback_url = data.get('callback_url')
+        callback_token = data.get('callback_token')
+        
+        if not all([job_id, callback_url, callback_token]):
+            error_msg = 'Missing required fields: job_id, callback_url, callback_token'
+            logger.error(error_msg)
+            return jsonify({'error': error_msg}), 400
+        
+        logger.info(f"Starting training job {job_id}")
+    except Exception as e:
+        logger.error(f"Error parsing request: {str(e)}", exc_info=True)
+        return jsonify({'error': f'Invalid request: {str(e)}'}), 400
     
     # Criar diretório do job
     job_dir = DATASETS_DIR / job_id
@@ -70,21 +83,33 @@ def train():
         dataset_url = data.get('dataset_url')
         
         if not dataset_url:
-            raise ValueError("dataset_url is required")
+            error_msg = "dataset_url is required in request payload"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
         logger.info(f"Downloading dataset from: {dataset_url}")
         
-        # Download com timeout e streaming
-        response = requests.get(dataset_url, stream=True, timeout=300)
-        response.raise_for_status()
-        
-        dataset_bytes = response.content
-        logger.info(f"Dataset downloaded: {len(dataset_bytes)} bytes")
+        try:
+            # Download com timeout e streaming
+            response = requests.get(dataset_url, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            dataset_bytes = response.content
+            logger.info(f"Dataset downloaded: {len(dataset_bytes)} bytes")
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Failed to download dataset from URL: {str(e)}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
         # Extrair dataset ZIP
         logger.info("Extracting dataset ZIP")
-        with zipfile.ZipFile(io.BytesIO(dataset_bytes)) as zip_ref:
-            zip_ref.extractall(job_dir)
+        try:
+            with zipfile.ZipFile(io.BytesIO(dataset_bytes)) as zip_ref:
+                zip_ref.extractall(job_dir)
+        except zipfile.BadZipFile as e:
+            error_msg = f"Invalid ZIP file: {str(e)}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
         # Verificar se data.yaml existe
         data_yaml_path = job_dir / 'data.yaml'
