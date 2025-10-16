@@ -185,28 +185,81 @@ def train():
                 # data.yaml não encontrado - gerar automaticamente
                 logger.info("data.yaml not found, generating automatically from dataset structure")
                 
-                # Procurar por diretórios images e labels
+                # Procurar por diretórios images e labels (recursivamente)
                 images_dirs = list(job_dir.rglob('images'))
                 labels_dirs = list(job_dir.rglob('labels'))
                 
                 if not images_dirs or not labels_dirs:
-                    raise FileNotFoundError("Dataset must contain 'images' and 'labels' directories")
-                
-                # Usar o primeiro conjunto encontrado
-                images_dir = images_dirs[0]
-                labels_dir = labels_dirs[0]
+                    # Tentar encontrar estrutura alternativa
+                    logger.warning("Standard 'images' and 'labels' directories not found, searching for alternatives...")
+                    
+                    # Procurar por qualquer pasta com imagens
+                    image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+                    found_images = False
+                    
+                    for ext in image_extensions:
+                        img_files = list(job_dir.rglob(ext))
+                        if img_files:
+                            found_images = True
+                            # Pegar o diretório pai das imagens encontradas
+                            images_dir = img_files[0].parent
+                            logger.info(f"Found images in: {images_dir}")
+                            break
+                    
+                    if not found_images:
+                        raise FileNotFoundError(
+                            f"Dataset must contain 'images' and 'labels' directories or image files. "
+                            f"Contents of job_dir: {list(job_dir.rglob('*'))[:20]}"
+                        )
+                    
+                    # Procurar labels correspondentes
+                    labels_dir = images_dir.parent / 'labels'
+                    if not labels_dir.exists():
+                        # Tentar encontrar pasta labels em qualquer lugar
+                        txt_files = list(job_dir.rglob('*.txt'))
+                        if txt_files:
+                            labels_dir = txt_files[0].parent
+                            logger.info(f"Found labels in: {labels_dir}")
+                        else:
+                            raise FileNotFoundError("Labels directory not found")
+                else:
+                    # Usar o primeiro conjunto encontrado
+                    images_dir = images_dirs[0]
+                    labels_dir = labels_dirs[0]
                 
                 logger.info(f"Found images dir: {images_dir}")
                 logger.info(f"Found labels dir: {labels_dir}")
                 
+                # Calcular caminhos relativos ao job_dir para o data.yaml
+                try:
+                    images_rel = images_dir.relative_to(job_dir)
+                    labels_rel = labels_dir.relative_to(job_dir)
+                except ValueError:
+                    # Se não conseguir calcular relativo, usar absoluto
+                    images_rel = images_dir
+                    labels_rel = labels_dir
+                
+                logger.info(f"Relative images path: {images_rel}")
+                logger.info(f"Relative labels path: {labels_rel}")
+                
                 # Detectar classes únicas dos arquivos .txt
                 classes = set()
+                label_count = 0
                 for label_file in labels_dir.rglob('*.txt'):
-                    with open(label_file, 'r') as f:
-                        for line in f:
-                            parts = line.strip().split()
-                            if parts:
-                                classes.add(int(parts[0]))
+                    try:
+                        with open(label_file, 'r') as f:
+                            for line in f:
+                                parts = line.strip().split()
+                                if parts:
+                                    classes.add(int(parts[0]))
+                        label_count += 1
+                    except Exception as e:
+                        logger.warning(f"Error reading label file {label_file}: {e}")
+                
+                if not classes:
+                    raise ValueError("No valid class labels found in dataset")
+                
+                logger.info(f"Found {label_count} label files")
                 
                 # Criar lista de nomes de classes
                 class_names = [f"class_{i}" for i in sorted(classes)]
@@ -214,11 +267,25 @@ def train():
                 
                 logger.info(f"Detected {num_classes} classes: {class_names}")
                 
-                # Gerar data.yaml
-                yaml_content = f"""# Auto-generated data.yaml
+                # Determinar se há splits train/val
+                has_train_val = (images_dir / 'train').exists() and (images_dir / 'val').exists()
+                
+                # Gerar data.yaml com caminhos corretos
+                if has_train_val:
+                    yaml_content = f"""# Auto-generated data.yaml
 path: {job_dir.absolute()}
-train: images
-val: images
+train: {images_rel}/train
+val: {images_rel}/val
+
+nc: {num_classes}
+names: {class_names}
+"""
+                else:
+                    # Sem split, usar mesma pasta para train e val
+                    yaml_content = f"""# Auto-generated data.yaml
+path: {job_dir.absolute()}
+train: {images_rel}
+val: {images_rel}
 
 nc: {num_classes}
 names: {class_names}
