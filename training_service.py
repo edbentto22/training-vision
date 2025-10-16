@@ -55,6 +55,73 @@ def train_info():
         'message': 'Service is running. Use POST method to start training job.'
     })
 
+@app.route('/debug/dataset', methods=['POST'])
+def debug_dataset():
+    """DEBUG: Inspecionar estrutura do dataset antes de treinar"""
+    try:
+        data = request.json
+        dataset_url = data.get('dataset_url')
+        
+        if not dataset_url:
+            return jsonify({'error': 'dataset_url required'}), 400
+        
+        logger.info(f"Debugging dataset from: {dataset_url}")
+        
+        # Download dataset
+        response = requests.get(dataset_url, stream=True, timeout=120)
+        response.raise_for_status()
+        dataset_bytes = response.content
+        
+        # Criar diretório temporário
+        import tempfile
+        import shutil
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            
+            # Extrair ZIP
+            with zipfile.ZipFile(io.BytesIO(dataset_bytes)) as zip_ref:
+                zip_ref.extractall(tmpdir_path)
+            
+            # Listar estrutura completa
+            all_items = []
+            for item in tmpdir_path.rglob('*'):
+                rel_path = str(item.relative_to(tmpdir_path))
+                is_dir = item.is_dir()
+                size = item.stat().st_size if item.is_file() else 0
+                all_items.append({
+                    'path': rel_path,
+                    'type': 'dir' if is_dir else 'file',
+                    'size': size
+                })
+            
+            # Contar tipos de arquivo
+            images = list(tmpdir_path.rglob('*.jpg')) + list(tmpdir_path.rglob('*.jpeg')) + list(tmpdir_path.rglob('*.png'))
+            labels = list(tmpdir_path.rglob('*.txt'))
+            
+            # Buscar pastas images e labels
+            images_dirs = list(tmpdir_path.rglob('images'))
+            labels_dirs = list(tmpdir_path.rglob('labels'))
+            
+            return jsonify({
+                'total_items': len(all_items),
+                'structure': all_items[:50],  # Primeiros 50 itens
+                'stats': {
+                    'total_images': len(images),
+                    'total_labels': len(labels),
+                    'images_dirs_found': len(images_dirs),
+                    'labels_dirs_found': len(labels_dirs),
+                    'images_dirs_paths': [str(d.relative_to(tmpdir_path)) for d in images_dirs],
+                    'labels_dirs_paths': [str(d.relative_to(tmpdir_path)) for d in labels_dirs],
+                },
+                'sample_images': [str(img.relative_to(tmpdir_path)) for img in images[:5]],
+                'sample_labels': [str(lbl.relative_to(tmpdir_path)) for lbl in labels[:5]],
+            })
+            
+    except Exception as e:
+        logger.error(f"Debug error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/train', methods=['POST'])
 def train():
     """Endpoint principal de treinamento"""
@@ -270,26 +337,29 @@ def train():
                 # Determinar se há splits train/val
                 has_train_val = (images_dir / 'train').exists() and (images_dir / 'val').exists()
                 
-                # Gerar data.yaml com caminhos corretos
+                logger.info(f"Has train/val split: {has_train_val}")
+                
+                # Gerar data.yaml com estrutura simples (sem path, apenas train/val absolutos)
                 if has_train_val:
+                    train_path = str((images_dir / 'train').absolute())
+                    val_path = str((images_dir / 'val').absolute())
                     yaml_content = f"""# Auto-generated data.yaml
-path: {job_dir.absolute()}
-train: {images_rel}/train
-val: {images_rel}/val
-
+train: {train_path}
+val: {val_path}
 nc: {num_classes}
 names: {class_names}
 """
                 else:
                     # Sem split, usar mesma pasta para train e val
+                    images_path = str(images_dir.absolute())
                     yaml_content = f"""# Auto-generated data.yaml
-path: {job_dir.absolute()}
-train: {images_rel}
-val: {images_rel}
-
+train: {images_path}
+val: {images_path}
 nc: {num_classes}
 names: {class_names}
 """
+                
+                logger.info(f"Generated data.yaml content:\n{yaml_content}")
                 
                 data_yaml_path = job_dir / 'data.yaml'
                 with open(data_yaml_path, 'w') as f:
