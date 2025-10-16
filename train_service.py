@@ -85,6 +85,24 @@ def train():
         logger.error(f"Error parsing request: {str(e)}", exc_info=True)
         return jsonify({'error': f'Invalid request: {str(e)}'}), 400
     
+    # Preparar callbacks antes de qualquer operação que possa falhar
+    def send_callback(callback_type, callback_data):
+        """Envia callback para o Supabase"""
+        try:
+            payload = {
+                'job_id': job_id,
+                'type': callback_type,
+                'data': callback_data
+            }
+            requests.post(
+                callback_url,
+                json=payload,
+                headers={'Authorization': f'Bearer {callback_token}'},
+                timeout=10
+            )
+        except Exception as e:
+            logger.error(f"Error sending callback: {e}")
+
     # Criar diretório do job
     job_dir = DATASETS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -156,30 +174,8 @@ def train():
         logger.info(f"Training on device: {device}")
         
         # 4. Definir callback de progresso
-        def send_callback(callback_type, callback_data):
-            """Envia callback para o Supabase"""
-            try:
-                payload = {
-                    'job_id': job_id,
-                    'type': callback_type,
-                    'data': callback_data
-                }
-                
-                response = requests.post(
-                    callback_url,
-                    json=payload,
-                    headers={'Authorization': f'Bearer {callback_token}'},
-                    timeout=10
-                )
-                
-                if response.status_code != 200:
-                    logger.warning(f"Callback failed: {response.status_code} - {response.text}")
-                else:
-                    logger.info(f"Callback sent: {callback_type}")
-                    
-            except Exception as e:
-                logger.error(f"Error sending callback: {e}")
-        
+        # Callback function is defined earlier to be available in early error paths
+
         # Callback customizado para cada época
         class TrainingCallback:
             def __init__(self, total_epochs):
@@ -296,4 +292,3 @@ if __name__ == '__main__':
     # Porta padrão: 5000
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
