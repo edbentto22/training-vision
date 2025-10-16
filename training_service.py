@@ -1,6 +1,7 @@
 """
 Serviço de Treinamento Real YOLO com Ultralytics
 Este serviço recebe requisições do Supabase Edge Function e executa treinamento real de modelos YOLO.
+VERSÃO FINAL - Atualizada 2025-10-16
 """
 
 from flask import Flask, request, jsonify
@@ -42,7 +43,8 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'device': device,
-        'ultralytics_version': YOLO.__version__ if hasattr(YOLO, '__version__') else 'unknown'
+        'ultralytics_version': YOLO.__version__ if hasattr(YOLO, '__version__') else 'unknown',
+        'version': 'v2.0-final'
     })
 
 @app.route('/train', methods=['GET'])
@@ -53,7 +55,8 @@ def train_info():
         'status': 'ready',
         'endpoint': '/train',
         'method': 'POST',
-        'message': 'Service is running. Use POST method to start training job.'
+        'message': 'Service is running. Use POST method to start training job.',
+        'version': 'v2.0-final'
     })
 
 @app.route('/debug/dataset', methods=['POST'])
@@ -75,7 +78,6 @@ def debug_dataset():
         
         # Criar diretório temporário
         import tempfile
-        import shutil
         
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir_path = Path(tmpdir)
@@ -104,6 +106,9 @@ def debug_dataset():
             images_dirs = list(tmpdir_path.rglob('images'))
             labels_dirs = list(tmpdir_path.rglob('labels'))
             
+            # Buscar data.yaml
+            yaml_files = list(tmpdir_path.rglob('data.yaml'))
+            
             return jsonify({
                 'total_items': len(all_items),
                 'structure': all_items[:50],  # Primeiros 50 itens
@@ -112,8 +117,10 @@ def debug_dataset():
                     'total_labels': len(labels),
                     'images_dirs_found': len(images_dirs),
                     'labels_dirs_found': len(labels_dirs),
+                    'yaml_files_found': len(yaml_files),
                     'images_dirs_paths': [str(d.relative_to(tmpdir_path)) for d in images_dirs],
                     'labels_dirs_paths': [str(d.relative_to(tmpdir_path)) for d in labels_dirs],
+                    'yaml_files_paths': [str(y.relative_to(tmpdir_path)) for y in yaml_files],
                 },
                 'sample_images': [str(img.relative_to(tmpdir_path)) for img in images[:5]],
                 'sample_labels': [str(lbl.relative_to(tmpdir_path)) for lbl in labels[:5]],
@@ -241,199 +248,190 @@ def train():
             logger.error(error_msg)
             raise ValueError(error_msg)
         
-        # Verificar se data.yaml existe
-        data_yaml_path = job_dir / 'data.yaml'
-        data_yaml_exists = data_yaml_path.exists()
+        # SEMPRE GERAR NOVO data.yaml (ignorar o que vem no ZIP)
+        logger.info("="*60)
+        logger.info("🔍 SCANNING DATASET STRUCTURE")
+        logger.info("="*60)
         
-        # SEMPRE BUSCAR RECURSIVAMENTE por data.yaml antigo para inspecionar
+        # BUSCAR data.yaml antigo para obter informações (mas NÃO usar)
         old_yaml_files = list(job_dir.rglob('data.yaml'))
         
         if old_yaml_files:
-            logger.warning(f"Found {len(old_yaml_files)} existing data.yaml file(s) in dataset")
+            logger.warning(f"⚠️  Found {len(old_yaml_files)} existing data.yaml file(s) in ZIP:")
             for old_yaml in old_yaml_files:
-                logger.warning(f"  - {old_yaml.relative_to(job_dir)}")
+                logger.warning(f"   - {old_yaml.relative_to(job_dir)}")
             
-            # LER o data.yaml existente para obter informações
+            # Ler o data.yaml existente apenas para informação
             try:
-                import yaml
                 with open(old_yaml_files[0], 'r') as f:
                     old_data = yaml.safe_load(f)
-                logger.info(f"Old data.yaml content: {old_data}")
-                
-                # Pegar número de classes do data.yaml antigo se disponível
-                old_nc = old_data.get('nc')
-                old_names = old_data.get('names', [])
-                logger.info(f"Old data.yaml had {old_nc} classes: {old_names}")
+                logger.info(f"📄 Old data.yaml content:")
+                logger.info(f"   path: {old_data.get('path', 'N/A')}")
+                logger.info(f"   train: {old_data.get('train', 'N/A')}")
+                logger.info(f"   val: {old_data.get('val', 'N/A')}")
+                logger.info(f"   nc: {old_data.get('nc', 'N/A')}")
+                logger.info(f"   names: {old_data.get('names', 'N/A')}")
             except Exception as e:
                 logger.warning(f"Could not read old data.yaml: {e}")
         
-        # SEMPRE GERAR NOVO data.yaml com caminhos corretos
-        logger.info("Generating NEW data.yaml with correct paths (ignoring existing one)")
+        logger.info("🔧 GENERATING NEW data.yaml with CORRECT absolute paths")
         
         # Procurar por diretórios images e labels (recursivamente)
         images_dirs = list(job_dir.rglob('images'))
         labels_dirs = list(job_dir.rglob('labels'))
-                
-                
-                if not images_dirs or not labels_dirs:
-                    # Tentar encontrar estrutura alternativa
-                    logger.warning("Standard 'images' and 'labels' directories not found, searching for alternatives...")
-                    
-                    # Procurar por qualquer pasta com imagens
-                    image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
-                    found_images = False
-                    
-                    for ext in image_extensions:
-                        img_files = list(job_dir.rglob(ext))
-                        if img_files:
-                            found_images = True
-                            # Pegar o diretório pai das imagens encontradas
-                            images_dir = img_files[0].parent
-                            logger.info(f"Found images in: {images_dir}")
-                            break
-                    
-                    if not found_images:
-                        raise FileNotFoundError(
-                            f"Dataset must contain 'images' and 'labels' directories or image files. "
-                            f"Contents of job_dir: {list(job_dir.rglob('*'))[:20]}"
-                        )
-                    
-                    # Procurar labels correspondentes
-                    labels_dir = images_dir.parent / 'labels'
-                    if not labels_dir.exists():
-                        # Tentar encontrar pasta labels em qualquer lugar
-                        txt_files = list(job_dir.rglob('*.txt'))
-                        if txt_files:
-                            labels_dir = txt_files[0].parent
-                            logger.info(f"Found labels in: {labels_dir}")
-                        else:
-                            raise FileNotFoundError("Labels directory not found")
+        
+        if not images_dirs or not labels_dirs:
+            # Tentar encontrar estrutura alternativa
+            logger.warning("⚠️  Standard 'images' and 'labels' directories not found")
+            logger.info("🔍 Searching for alternative structure...")
+            
+            # Procurar por qualquer pasta com imagens
+            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+            found_images = False
+            
+            for ext in image_extensions:
+                img_files = list(job_dir.rglob(ext))
+                if img_files:
+                    found_images = True
+                    # Pegar o diretório pai das imagens encontradas
+                    images_dir = img_files[0].parent
+                    logger.info(f"✅ Found images in: {images_dir.relative_to(job_dir)}")
+                    break
+            
+            if not found_images:
+                # Listar conteúdo para debug
+                all_files = list(job_dir.rglob('*'))[:30]
+                logger.error(f"❌ No images found! Contents (first 30):")
+                for f in all_files:
+                    logger.error(f"   - {f.relative_to(job_dir)}")
+                raise FileNotFoundError(
+                    f"Dataset must contain 'images' directory or image files"
+                )
+            
+            # Procurar labels correspondentes
+            labels_dir = images_dir.parent / 'labels'
+            if not labels_dir.exists():
+                # Tentar encontrar pasta labels em qualquer lugar
+                txt_files = list(job_dir.rglob('*.txt'))
+                if txt_files:
+                    labels_dir = txt_files[0].parent
+                    logger.info(f"✅ Found labels in: {labels_dir.relative_to(job_dir)}")
                 else:
-                    # Usar o primeiro conjunto encontrado
-                    images_dir = images_dirs[0]
-                    labels_dir = labels_dirs[0]
-                
-                logger.info(f"Found images dir: {images_dir}")
-                logger.info(f"Found labels dir: {labels_dir}")
-                
-                # Calcular caminhos relativos ao job_dir para o data.yaml
-                try:
-                    images_rel = images_dir.relative_to(job_dir)
-                    labels_rel = labels_dir.relative_to(job_dir)
-                except ValueError:
-                    # Se não conseguir calcular relativo, usar absoluto
-                    images_rel = images_dir
-                    labels_rel = labels_dir
-                
-                logger.info(f"Relative images path: {images_rel}")
-                logger.info(f"Relative labels path: {labels_rel}")
-                
-                # Detectar classes únicas dos arquivos .txt
-                classes = set()
-                label_count = 0
-                invalid_labels = []
-                
-                for label_file in labels_dir.rglob('*.txt'):
-                    try:
-                        with open(label_file, 'r') as f:
-                            for line_num, line in enumerate(f, 1):
-                                parts = line.strip().split()
-                                if parts:
-                                    try:
-                                        class_id = int(parts[0])
-                                        if class_id < 0:
-                                            invalid_labels.append(f"{label_file.name}:L{line_num} - negative class {class_id}")
-                                        classes.add(class_id)
-                                    except ValueError:
-                                        invalid_labels.append(f"{label_file.name}:L{line_num} - invalid class format")
-                        label_count += 1
-                    except Exception as e:
-                        logger.warning(f"Error reading label file {label_file}: {e}")
-                
-                if not classes:
-                    raise ValueError("No valid class labels found in dataset")
-                
-                logger.info(f"Found {label_count} label files")
-                
-                # Validar se classes são sequenciais começando do 0
-                max_class = max(classes)
-                min_class = min(classes)
-                num_classes_detected = len(classes)
-                
-                logger.info(f"Classes range: {min_class} to {max_class}")
-                logger.info(f"Unique classes detected: {num_classes_detected}")
-                logger.info(f"Classes found: {sorted(classes)}")
-                
-                # CRITICAL: Verificar se há classes fora do range esperado
-                if max_class >= num_classes_detected:
-                    logger.warning(f"⚠️ CRITICAL: max class ID ({max_class}) >= num_classes ({num_classes_detected})")
-                    logger.warning("This will cause 'index out of bounds' error during training!")
-                    logger.warning(f"Expected classes: 0 to {num_classes_detected-1}")
-                    logger.warning(f"Found classes: {sorted(classes)}")
-                    
-                    # Opção 1: Ajustar num_classes para max_class + 1
-                    num_classes = max_class + 1
-                    logger.warning(f"Auto-adjusting num_classes to {num_classes}")
-                    
-                    # Criar nomes para todas as classes até max_class
-                    class_names = [f"class_{i}" for i in range(num_classes)]
-                else:
-                    # Usar número de classes detectadas
-                    num_classes = num_classes_detected
-                    class_names = [f"class_{i}" for i in sorted(classes)]
-                
-                if invalid_labels:
-                    logger.warning(f"Found {len(invalid_labels)} invalid label entries:")
-                    for inv in invalid_labels[:10]:  # Log primeiros 10
-                        logger.warning(f"  - {inv}")
-                
-                logger.info(f"Final configuration: {num_classes} classes: {class_names}")
-                
-                # Determinar se há splits train/val
-                has_train_val = (images_dir / 'train').exists() and (images_dir / 'val').exists()
-                
-                logger.info(f"Has train/val split: {has_train_val}")
-                
-                # Gerar data.yaml com estrutura simples (sem path, apenas train/val absolutos)
-                if has_train_val:
-                    train_path = str((images_dir / 'train').absolute())
-                    val_path = str((images_dir / 'val').absolute())
-                    yaml_content = f"""# Auto-generated data.yaml
+                    raise FileNotFoundError("Labels directory not found")
+        else:
+            # Usar o primeiro conjunto encontrado
+            images_dir = images_dirs[0]
+            labels_dir = labels_dirs[0]
+        
+        logger.info(f"📂 Images directory: {images_dir}")
+        logger.info(f"📂 Labels directory: {labels_dir}")
+        
+        # Detectar classes únicas dos arquivos .txt
+        classes = set()
+        label_count = 0
+        invalid_labels = []
+        
+        for label_file in labels_dir.rglob('*.txt'):
+            try:
+                with open(label_file, 'r') as f:
+                    for line_num, line in enumerate(f, 1):
+                        parts = line.strip().split()
+                        if parts:
+                            try:
+                                class_id = int(parts[0])
+                                if class_id < 0:
+                                    invalid_labels.append(f"{label_file.name}:L{line_num} - negative class {class_id}")
+                                classes.add(class_id)
+                            except ValueError:
+                                invalid_labels.append(f"{label_file.name}:L{line_num} - invalid class format")
+                label_count += 1
+            except Exception as e:
+                logger.warning(f"Error reading label file {label_file}: {e}")
+        
+        if not classes:
+            raise ValueError("No valid class labels found in dataset")
+        
+        logger.info(f"📊 Found {label_count} label files")
+        
+        # Validar se classes são sequenciais começando do 0
+        max_class = max(classes)
+        min_class = min(classes)
+        num_classes_detected = len(classes)
+        
+        logger.info(f"📊 Classes range: {min_class} to {max_class}")
+        logger.info(f"📊 Unique classes detected: {num_classes_detected}")
+        logger.info(f"📊 Classes found: {sorted(classes)}")
+        
+        # CRITICAL: Verificar se há classes fora do range esperado
+        if max_class >= num_classes_detected:
+            logger.warning(f"⚠️  CRITICAL: max class ID ({max_class}) >= num_classes ({num_classes_detected})")
+            logger.warning("    This could cause 'index out of bounds' error during training!")
+            logger.warning(f"    Expected classes: 0 to {num_classes_detected-1}")
+            logger.warning(f"    Found classes: {sorted(classes)}")
+            
+            # Ajustar num_classes para max_class + 1
+            num_classes = max_class + 1
+            logger.warning(f"🔧 Auto-adjusting num_classes to {num_classes}")
+            
+            # Criar nomes para todas as classes até max_class
+            class_names = [f"class_{i}" for i in range(num_classes)]
+        else:
+            # Usar número de classes detectadas
+            num_classes = num_classes_detected
+            class_names = [f"class_{i}" for i in sorted(classes)]
+        
+        if invalid_labels:
+            logger.warning(f"⚠️  Found {len(invalid_labels)} invalid label entries:")
+            for inv in invalid_labels[:10]:  # Log primeiros 10
+                logger.warning(f"    - {inv}")
+        
+        logger.info(f"✅ Final configuration: {num_classes} classes")
+        
+        # Determinar se há splits train/val
+        has_train_val = (images_dir / 'train').exists() and (images_dir / 'val').exists()
+        
+        logger.info(f"📁 Has train/val split: {has_train_val}")
+        
+        # Gerar data.yaml com caminhos ABSOLUTOS
+        if has_train_val:
+            train_path = str((images_dir / 'train').absolute())
+            val_path = str((images_dir / 'val').absolute())
+            yaml_content = f"""# Auto-generated data.yaml by Training Service
 train: {train_path}
 val: {val_path}
 nc: {num_classes}
 names: {class_names}
 """
-                else:
-                    # Sem split, usar mesma pasta para train e val
-                    images_path = str(images_dir.absolute())
-                    yaml_content = f"""# Auto-generated data.yaml
+        else:
+            # Sem split, usar mesma pasta para train e val
+            images_path = str(images_dir.absolute())
+            yaml_content = f"""# Auto-generated data.yaml by Training Service
 train: {images_path}
 val: {images_path}
 nc: {num_classes}
 names: {class_names}
 """
-                
-                logger.info(f"Generated data.yaml content:\n{yaml_content}")
-                
-                # Salvar o NOVO data.yaml na raiz do job_dir
-                data_yaml_path = job_dir / 'data.yaml'
-                with open(data_yaml_path, 'w') as f:
-                    f.write(yaml_content)
-                
-                logger.info(f"Generated NEW data.yaml at: {data_yaml_path}")
+        
+        # Salvar o NOVO data.yaml na raiz do job_dir
+        data_yaml_path = job_dir / 'data.yaml'
+        with open(data_yaml_path, 'w') as f:
+            f.write(yaml_content)
+        
+        logger.info(f"✅ Generated NEW data.yaml at: {data_yaml_path}")
         
         # Verificar se o arquivo foi criado
         if not data_yaml_path.exists():
             raise FileNotFoundError(f"Failed to create data.yaml at {data_yaml_path}")
         
         # LOG do conteúdo final do data.yaml
-        logger.info("="*50)
-        logger.info("FINAL data.yaml content:")
+        logger.info("="*60)
+        logger.info("📄 FINAL data.yaml content:")
+        logger.info("="*60)
         with open(data_yaml_path, 'r') as f:
             final_yaml = f.read()
-            logger.info(final_yaml)
-        logger.info("="*50)
+            for line in final_yaml.split('\n'):
+                logger.info(f"  {line}")
+        logger.info("="*60)
         
         # 2. Carregar modelo base
         base_model = data.get('base_model', 'yolov8n')
@@ -596,4 +594,5 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting YOLO Training Service on port {port}")
     logger.info(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    logger.info(f"Version: v2.0-final")
     app.run(host='0.0.0.0', port=port, debug=False)
