@@ -58,6 +58,37 @@ def train_info():
 @app.route('/train', methods=['POST'])
 def train():
     """Endpoint principal de treinamento"""
+    
+    # Inicializar variáveis no início para escopo correto
+    job_id = None
+    callback_url = None
+    callback_token = None
+    job_dir = None
+    
+    # Definir send_callback NO INÍCIO antes de qualquer uso
+    def send_callback(callback_type, callback_data):
+        """Envia callback para o Supabase"""
+        try:
+            # Verificar se variáveis necessárias existem
+            if not all([job_id, callback_url, callback_token]):
+                logger.warning("Cannot send callback - missing required variables")
+                return
+                
+            payload = {
+                'job_id': job_id,
+                'type': callback_type,
+                'data': callback_data
+            }
+            response = requests.post(
+                callback_url,
+                json=payload,
+                headers={'Authorization': f'Bearer {callback_token}'},
+                timeout=10
+            )
+            logger.info(f"Callback sent: {callback_type} - Status: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Error sending callback: {e}")
+    
     try:
         data = request.json
         
@@ -81,28 +112,16 @@ def train():
             return jsonify({'error': error_msg}), 400
         
         logger.info(f"Starting training job {job_id}")
+        
+        # Notificar que o job foi aceito e está iniciando
+        send_callback('training_started', {
+            'message': 'Training job accepted and starting'
+        })
+        
     except Exception as e:
         logger.error(f"Error parsing request: {str(e)}", exc_info=True)
         return jsonify({'error': f'Invalid request: {str(e)}'}), 400
     
-    # Preparar callbacks antes de qualquer operação que possa falhar
-    def send_callback(callback_type, callback_data):
-        """Envia callback para o Supabase"""
-        try:
-            payload = {
-                'job_id': job_id,
-                'type': callback_type,
-                'data': callback_data
-            }
-            requests.post(
-                callback_url,
-                json=payload,
-                headers={'Authorization': f'Bearer {callback_token}'},
-                timeout=10
-            )
-        except Exception as e:
-            logger.error(f"Error sending callback: {e}")
-
     # Criar diretório do job
     job_dir = DATASETS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -119,11 +138,25 @@ def train():
         logger.info(f"Downloading dataset from: {dataset_url}")
         
         try:
-            # Download com timeout e streaming
-            response = requests.get(dataset_url, stream=True, timeout=300)
+            # Download com timeout maior e streaming para datasets grandes
+            response = requests.get(dataset_url, stream=True, timeout=600)
             response.raise_for_status()
             
-            dataset_bytes = response.content
+            # Download com progresso
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            chunks = []
+            
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    chunks.append(chunk)
+                    downloaded += len(chunk)
+                    # Log a cada 10MB
+                    if total_size > 0 and downloaded % (1024 * 1024 * 10) < 8192:
+                        progress = int((downloaded / total_size) * 100)
+                        logger.info(f"Download progress: {progress}%")
+            
+            dataset_bytes = b''.join(chunks)
             logger.info(f"Dataset downloaded: {len(dataset_bytes)} bytes")
         except requests.exceptions.RequestException as e:
             error_msg = f"Failed to download dataset from URL: {str(e)}"
@@ -233,10 +266,7 @@ names: {class_names}
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         logger.info(f"Training on device: {device}")
         
-        # 4. Definir callback de progresso
-        # Callback function is defined earlier to be available in early error paths
-
-        # Callback customizado para cada época
+        # 4. Callback customizado para cada época
         class TrainingCallback:
             def __init__(self, total_epochs):
                 self.total_epochs = total_epochs
@@ -322,8 +352,13 @@ names: {class_names}
         
         # 8. Cleanup
         logger.info(f"Cleaning up job {job_id}")
-        shutil.rmtree(job_dir, ignore_errors=True)
-        shutil.rmtree(RUNS_DIR / job_id, ignore_errors=True)
+        try:
+            if job_dir and job_dir.exists():
+                shutil.rmtree(job_dir, ignore_errors=True)
+            if job_id and (RUNS_DIR / job_id).exists():
+                shutil.rmtree(RUNS_DIR / job_id, ignore_errors=True)
+        except Exception as cleanup_error:
+            logger.error(f"Error during cleanup: {cleanup_error}")
         
         return jsonify({
             'success': True,
@@ -339,16 +374,23 @@ names: {class_names}
             'error': str(e)
         })
         
-        # Cleanup em caso de erro
-        shutil.rmtree(job_dir, ignore_errors=True)
-        shutil.rmtree(RUNS_DIR / job_id, ignore_errors=True)
+        # Cleanup em caso de erro com verificação de existência
+        try:
+            if job_dir and job_dir.exists():
+                shutil.rmtree(job_dir, ignore_errors=True)
+            if job_id and (RUNS_DIR / job_id).exists():
+                shutil.rmtree(RUNS_DIR / job_id, ignore_errors=True)
+        except Exception as cleanup_error:
+            logger.error(f"Error during cleanup: {cleanup_error}")
         
         return jsonify({
             'error': str(e),
-            'job_id': job_id
+            'job_id': job_id if job_id else 'unknown'
         }), 500
 
 if __name__ == '__main__':
-    # Porta padrão: 5000
+    # Porta padrão: 5000 (configurável via variável de ambiente PORT)
     port = int(os.environ.get('PORT', 5000))
+    logger.info(f"Starting YOLO Training Service on port {port}")
+    logger.info(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
     app.run(host='0.0.0.0', port=port, debug=False)
