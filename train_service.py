@@ -147,10 +147,57 @@ def train():
             yaml_files = list(job_dir.rglob('data.yaml'))
             if yaml_files:
                 data_yaml_path = yaml_files[0]
+                logger.info(f"Found data.yaml at: {data_yaml_path}")
             else:
-                raise FileNotFoundError("data.yaml not found in dataset")
-        
-        logger.info(f"Found data.yaml at: {data_yaml_path}")
+                # data.yaml não encontrado - gerar automaticamente
+                logger.info("data.yaml not found, generating automatically from dataset structure")
+                
+                # Procurar por diretórios images e labels
+                images_dirs = list(job_dir.rglob('images'))
+                labels_dirs = list(job_dir.rglob('labels'))
+                
+                if not images_dirs or not labels_dirs:
+                    raise FileNotFoundError("Dataset must contain 'images' and 'labels' directories")
+                
+                # Usar o primeiro conjunto encontrado
+                images_dir = images_dirs[0]
+                labels_dir = labels_dirs[0]
+                
+                logger.info(f"Found images dir: {images_dir}")
+                logger.info(f"Found labels dir: {labels_dir}")
+                
+                # Detectar classes únicas dos arquivos .txt
+                classes = set()
+                for label_file in labels_dir.rglob('*.txt'):
+                    with open(label_file, 'r') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if parts:
+                                classes.add(int(parts[0]))
+                
+                # Criar lista de nomes de classes
+                class_names = [f"class_{i}" for i in sorted(classes)]
+                num_classes = len(class_names)
+                
+                logger.info(f"Detected {num_classes} classes: {class_names}")
+                
+                # Gerar data.yaml
+                yaml_content = f"""# Auto-generated data.yaml
+path: {job_dir.absolute()}
+train: images
+val: images
+
+nc: {num_classes}
+names: {class_names}
+"""
+                
+                data_yaml_path = job_dir / 'data.yaml'
+                with open(data_yaml_path, 'w') as f:
+                    f.write(yaml_content)
+                
+                logger.info(f"Generated data.yaml at: {data_yaml_path}")
+        else:
+            logger.info(f"Found existing data.yaml at: {data_yaml_path}")
         
         # 2. Carregar modelo base
         base_model = data.get('base_model', 'yolov8n')
