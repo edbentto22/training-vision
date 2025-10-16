@@ -11,6 +11,7 @@ import os
 import shutil
 import requests
 import logging
+import yaml
 from pathlib import Path
 from ultralytics import YOLO
 import torch
@@ -242,19 +243,37 @@ def train():
         
         # Verificar se data.yaml existe
         data_yaml_path = job_dir / 'data.yaml'
-        if not data_yaml_path.exists():
-            # Procurar em subdiretórios
-            yaml_files = list(job_dir.rglob('data.yaml'))
-            if yaml_files:
-                data_yaml_path = yaml_files[0]
-                logger.info(f"Found data.yaml at: {data_yaml_path}")
-            else:
-                # data.yaml não encontrado - gerar automaticamente
-                logger.info("data.yaml not found, generating automatically from dataset structure")
+        data_yaml_exists = data_yaml_path.exists()
+        
+        # SEMPRE BUSCAR RECURSIVAMENTE por data.yaml antigo para inspecionar
+        old_yaml_files = list(job_dir.rglob('data.yaml'))
+        
+        if old_yaml_files:
+            logger.warning(f"Found {len(old_yaml_files)} existing data.yaml file(s) in dataset")
+            for old_yaml in old_yaml_files:
+                logger.warning(f"  - {old_yaml.relative_to(job_dir)}")
+            
+            # LER o data.yaml existente para obter informações
+            try:
+                import yaml
+                with open(old_yaml_files[0], 'r') as f:
+                    old_data = yaml.safe_load(f)
+                logger.info(f"Old data.yaml content: {old_data}")
                 
-                # Procurar por diretórios images e labels (recursivamente)
-                images_dirs = list(job_dir.rglob('images'))
-                labels_dirs = list(job_dir.rglob('labels'))
+                # Pegar número de classes do data.yaml antigo se disponível
+                old_nc = old_data.get('nc')
+                old_names = old_data.get('names', [])
+                logger.info(f"Old data.yaml had {old_nc} classes: {old_names}")
+            except Exception as e:
+                logger.warning(f"Could not read old data.yaml: {e}")
+        
+        # SEMPRE GERAR NOVO data.yaml com caminhos corretos
+        logger.info("Generating NEW data.yaml with correct paths (ignoring existing one)")
+        
+        # Procurar por diretórios images e labels (recursivamente)
+        images_dirs = list(job_dir.rglob('images'))
+        labels_dirs = list(job_dir.rglob('labels'))
+                
                 
                 if not images_dirs or not labels_dirs:
                     # Tentar encontrar estrutura alternativa
@@ -312,13 +331,21 @@ def train():
                 # Detectar classes únicas dos arquivos .txt
                 classes = set()
                 label_count = 0
+                invalid_labels = []
+                
                 for label_file in labels_dir.rglob('*.txt'):
                     try:
                         with open(label_file, 'r') as f:
-                            for line in f:
+                            for line_num, line in enumerate(f, 1):
                                 parts = line.strip().split()
                                 if parts:
-                                    classes.add(int(parts[0]))
+                                    try:
+                                        class_id = int(parts[0])
+                                        if class_id < 0:
+                                            invalid_labels.append(f"{label_file.name}:L{line_num} - negative class {class_id}")
+                                        classes.add(class_id)
+                                    except ValueError:
+                                        invalid_labels.append(f"{label_file.name}:L{line_num} - invalid class format")
                         label_count += 1
                     except Exception as e:
                         logger.warning(f"Error reading label file {label_file}: {e}")
@@ -328,11 +355,39 @@ def train():
                 
                 logger.info(f"Found {label_count} label files")
                 
-                # Criar lista de nomes de classes
-                class_names = [f"class_{i}" for i in sorted(classes)]
-                num_classes = len(class_names)
+                # Validar se classes são sequenciais começando do 0
+                max_class = max(classes)
+                min_class = min(classes)
+                num_classes_detected = len(classes)
                 
-                logger.info(f"Detected {num_classes} classes: {class_names}")
+                logger.info(f"Classes range: {min_class} to {max_class}")
+                logger.info(f"Unique classes detected: {num_classes_detected}")
+                logger.info(f"Classes found: {sorted(classes)}")
+                
+                # CRITICAL: Verificar se há classes fora do range esperado
+                if max_class >= num_classes_detected:
+                    logger.warning(f"⚠️ CRITICAL: max class ID ({max_class}) >= num_classes ({num_classes_detected})")
+                    logger.warning("This will cause 'index out of bounds' error during training!")
+                    logger.warning(f"Expected classes: 0 to {num_classes_detected-1}")
+                    logger.warning(f"Found classes: {sorted(classes)}")
+                    
+                    # Opção 1: Ajustar num_classes para max_class + 1
+                    num_classes = max_class + 1
+                    logger.warning(f"Auto-adjusting num_classes to {num_classes}")
+                    
+                    # Criar nomes para todas as classes até max_class
+                    class_names = [f"class_{i}" for i in range(num_classes)]
+                else:
+                    # Usar número de classes detectadas
+                    num_classes = num_classes_detected
+                    class_names = [f"class_{i}" for i in sorted(classes)]
+                
+                if invalid_labels:
+                    logger.warning(f"Found {len(invalid_labels)} invalid label entries:")
+                    for inv in invalid_labels[:10]:  # Log primeiros 10
+                        logger.warning(f"  - {inv}")
+                
+                logger.info(f"Final configuration: {num_classes} classes: {class_names}")
                 
                 # Determinar se há splits train/val
                 has_train_val = (images_dir / 'train').exists() and (images_dir / 'val').exists()
@@ -361,13 +416,24 @@ names: {class_names}
                 
                 logger.info(f"Generated data.yaml content:\n{yaml_content}")
                 
+                # Salvar o NOVO data.yaml na raiz do job_dir
                 data_yaml_path = job_dir / 'data.yaml'
                 with open(data_yaml_path, 'w') as f:
                     f.write(yaml_content)
                 
-                logger.info(f"Generated data.yaml at: {data_yaml_path}")
-        else:
-            logger.info(f"Found existing data.yaml at: {data_yaml_path}")
+                logger.info(f"Generated NEW data.yaml at: {data_yaml_path}")
+        
+        # Verificar se o arquivo foi criado
+        if not data_yaml_path.exists():
+            raise FileNotFoundError(f"Failed to create data.yaml at {data_yaml_path}")
+        
+        # LOG do conteúdo final do data.yaml
+        logger.info("="*50)
+        logger.info("FINAL data.yaml content:")
+        with open(data_yaml_path, 'r') as f:
+            final_yaml = f.read()
+            logger.info(final_yaml)
+        logger.info("="*50)
         
         # 2. Carregar modelo base
         base_model = data.get('base_model', 'yolov8n')
