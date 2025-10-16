@@ -203,6 +203,19 @@ names: {class_names}
         base_model = data.get('base_model', 'yolov8n')
         logger.info(f"Loading base model: {base_model}")
         
+        # Validar modelo base (YOLOv8-v11 disponíveis)
+        valid_models = [
+            'yolov8n', 'yolov8s', 'yolov8m', 'yolov8l', 'yolov8x',
+            'yolov9t', 'yolov9s', 'yolov9m', 'yolov9c', 'yolov9e',
+            'yolov10n', 'yolov10s', 'yolov10m', 'yolov10b', 'yolov10l', 'yolov10x',
+            'yolov11n', 'yolov11s', 'yolov11m', 'yolov11l', 'yolov11x'
+        ]
+        
+        if base_model not in valid_models:
+            error_msg = f"Invalid base_model '{base_model}'. Valid models: {', '.join(valid_models)}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+        
         # Garantir que o modelo tem a extensão .pt
         if not base_model.endswith('.pt'):
             base_model = f"{base_model}.pt"
