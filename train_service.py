@@ -44,6 +44,17 @@ def health_check():
         'ultralytics_version': YOLO.__version__ if hasattr(YOLO, '__version__') else 'unknown'
     })
 
+@app.route('/train', methods=['GET'])
+def train_info():
+    """Endpoint de informação (GET) - Use POST para treinar"""
+    return jsonify({
+        'service': 'YOLO Training Service',
+        'status': 'ready',
+        'endpoint': '/train',
+        'method': 'POST',
+        'message': 'Service is running. Use POST method to start training job.'
+    })
+
 @app.route('/train', methods=['POST'])
 def train():
     """Endpoint principal de treinamento"""
@@ -285,3 +296,4 @@ if __name__ == '__main__':
     # Porta padrão: 5000
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
+
