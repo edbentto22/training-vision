@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  yolo-training:
+    build: .
+    container_name: yolo-training-service
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - PORT=5000
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Persistir dados de treinamento (opcional - comente se não quiser)
+      - ./workdir:/app/workdir
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Descomentar se tiver GPU NVIDIA com Docker + nvidia-container-toolkit
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
