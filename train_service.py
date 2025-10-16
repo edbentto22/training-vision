@@ -271,6 +271,9 @@ names: {class_names}
         # 5. Iniciar treinamento
         callback_handler = TrainingCallback(epochs)
         
+        # Adicionar callback ao modelo antes do treinamento
+        model.add_callback('on_train_epoch_end', callback_handler.on_train_epoch_end)
+        
         logger.info(f"Starting training: {epochs} epochs, batch={batch_size}, imgsz={img_size}")
         
         results = model.train(
@@ -282,10 +285,7 @@ names: {class_names}
             device=device,
             project=str(RUNS_DIR),
             name=job_id,
-            exist_ok=True,
-            callbacks={
-                'on_train_epoch_end': callback_handler.on_train_epoch_end
-            }
+            exist_ok=True
         )
         
         logger.info(f"Training completed for job {job_id}")
